@@ -3,6 +3,10 @@
 
 /* ALL_EXIT_OK */
 
+function filter_whitespace($t) {
+	return !is_array($t) || $t[0] !== T_WHITESPACE;
+}
+
 function get_token($reset = false, $source = null) {
 	static $tokens = array();
 	static $i = 0;
@@ -19,17 +23,13 @@ function get_token($reset = false, $source = null) {
 	if ($reset) {
 		$i = 0;
 		if ($source !== null) {
-			$tokens = token_get_all($source);
+			$tokens = array_values(array_filter(token_get_all($source), 'filter_whitespace'));
 			$tc = count($tokens);
 		}
 		return;
 	}
 
 	while ($tc > $i) {
-		if (is_array($tokens[$i]) && $tokens[$i][0] == T_WHITESPACE) {
-			$i++;
-			continue;
-		}
 		$t = $tokens[$i];
 		$i++;
 
@@ -105,7 +105,7 @@ function check_foreach_ref() {
 			if ($t[0] != T_UNSET) {
 				$errors[] = $check_next_token_is_unset['t'][2];
 			}
-			else { 
+			else {
 				get_token('PUSH_BACK');
 			}
 			$check_next_token_is_unset = false;
@@ -210,7 +210,7 @@ function check_bad_exits() {
 					}
 				}
 				if ($semicolon_t[0] == ';') {
-					if ($exit_is_error) {	
+					if ($exit_is_error) {
 						$errors[] = $t[2];
 					}
 					break;
@@ -218,6 +218,129 @@ function check_bad_exits() {
 			}
 		}
 	}
+	return $errors;
+}
+
+function is_bad_call($loop, $token, $pattern, $in_header) {
+	$str = $token[1];
+	$tcount = 0;
+	while ($t = get_token()) {
+		$tcount++;
+		$str .= $t[1];
+		if ($t[0] === '(') {
+			break;
+		}
+	}
+
+	$match = preg_match($pattern, $str);
+
+	while ($tcount-- > 0) { // restore state
+		get_token('PUSH_BACK');
+	}
+
+	return $match ? $token[2] : null;
+}
+
+function check_fncall_in_loops($pattern) {
+	$pattern = '#^('.$pattern.')\($#i';
+
+	$the_loops = array(
+		T_DO => 1,
+		T_FOR => 1,
+		T_FOREACH => 1,
+		T_WHILE => 1,
+	);
+
+	$errors = array();
+	$loops = array();
+	$curlies = 0;
+	$just_after_loop_head = $eat_head = false;
+
+	while ($t = get_token()) {
+		if (isset($the_loops[ $t[0] ])) {
+			$loops[] = array(
+				'token' => $t,
+				'curlies' => $curlies,
+			);
+			$eat_head = true;
+		}
+		else if ($loops) {
+			if ($eat_head) {
+				$eat_head = false;
+
+				if ($t[0] === '(') {
+					// loop has head
+					$parens = 1;
+					$skip_the_rest = false;
+					while ($lh_t = get_token()) {
+						if ($lh_t[0] === '(') {
+							$parens++;
+						}
+						else if ($lh_t[0] === ')') {
+							$parens--;
+							if ($parens == 0) {
+								$just_after_loop_head = true;
+								break;
+							}
+						}
+						else if ($lh_t[0] === T_AS && $loops[ count($loops) - 1 ]['token'][0] === T_FOREACH) {
+							$skip_the_rest = true;
+						}
+
+						if ($skip_the_rest) {
+							continue;
+						}
+
+						if ($lh_t[0] !== T_STRING) { // function calls start with T_STRING
+							continue;
+						}
+
+						// we are inside a loop's head
+						if ($e = is_bad_call($loops[ count($loops) - 1 ]['token'], $lh_t, $pattern, true)) {
+							$errors[] = $e;
+						}
+					}
+				}
+				else {
+					get_token('PUSH_BACK');
+				}
+			}
+			else if ($just_after_loop_head) {
+				if ($t[0] === '{') {
+					$curlies++;
+				}
+				else if ($t[0] === ';') {
+					if ($curlies == $loops[ count($loops) - 1 ]['curlies']) {
+						// loop's over bitches
+						array_pop($loops);
+					}
+				}
+				else {
+					// perhaps i could eat up until ; here, and call is_bad_call
+					// that way we'd handle blockless loops too
+					die("single-statement loop, we dont like you\n");
+				}
+				$just_after_loop_head = false;
+			}
+			else if ($t[0] === '{') {
+				$curlies++;
+			}
+			else if ($t[0] === '}') {
+				$curlies--;
+				if ($curlies == $loops[ count($loops) - 1 ]['curlies']) {
+					// loop's over bitches
+					array_pop($loops);
+				}
+			}
+			else if ($t[0] === T_STRING) {
+				// we are inside a loop and this *could* be the start of a function call
+				if ($e = is_bad_call($loops[ count($loops) - 1]['token'], $t, $pattern, false)) {
+					$errors[] = $e;
+				}
+			}
+		}
+	}
+
 	return $errors;
 }
 
@@ -231,6 +354,11 @@ function ignored($fn, $patterns) {
 }
 
 $checks = array(
+	'fncall_in_loops' => array(
+		'fn' => 'check_fncall_in_loops',
+		'desc' => 'warn if specific calls are made inside a loop',
+		'default_arg' => 'm|sel::\w+',
+	),
 	'unset' => array(
 		'fn' => 'check_foreach_ref',
 		'desc' => 'warn if a foreach ($array as &$ref) ... has no unset($ref) immediately after',
@@ -251,21 +379,31 @@ $checks = array(
 
 $run_checks = array();
 while ($argc > 1 && $argv[1][0] == '-') {
+	$opt = null;
 	list($chk) = array_splice($argv, 1, 1);
 	$chk = substr($chk, 1);
+	if (strpos($chk, '=') !== false) {
+		list($chk, $opt) = explode('=', $chk, 2);
+	}
 	if (!isset($checks[$chk])) {
 		die("invalid check $chk passed\n");
 	}
 	$argc--;
 
-	$run_checks[] = $chk;
+	if ($opt === null && isset($checks[$chk]['default_arg'])) {
+		$opt = $checks[$chk]['default_arg'];
+	}
+
+	$run_checks[$chk] = $opt;
 }
 
 if (empty($run_checks)) {
-	$run_checks = array_keys($checks);
+	foreach ($checks as $name => $def) {
+		$run_checks[ $name ] = isset($def['default_arg'])
+			? $def['default_arg']
+			: null;
+	}
 }
-
-$run_checks = array_unique($run_checks);
 
 if ($argc > 1) {
 	$ignore = array();
@@ -282,10 +420,10 @@ if ($argc > 1) {
 		$errors = array();
 		get_token(true, file_get_contents($a));
 
-		foreach ($run_checks as $key) {
+		foreach ($run_checks as $key => $opt) {
 			$fn = $checks[$key]['fn'];
 			get_token(true);
-			$check_errors = $fn();
+			$check_errors = $fn($opt);
 			if (!empty($check_errors)) {
 				$errors[$key] = $check_errors;
 			}
@@ -308,7 +446,11 @@ else {
 	echo $argv[0], ' ', implode(' ', $opts), " files...\n";
 	echo " by default, all checks are on\n";
 	foreach ($checks as $k => $c) {
-		echo " -$k:\n";
+		echo " -$k:";
+		if (isset($c['default_arg'])) {
+			echo " (default: {$c['default_arg']})";
+		}
+		echo "\n";
 		foreach (explode("\n", $c['desc']) as $d) {
 			echo "   $d\n";
 		}
